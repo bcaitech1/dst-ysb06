@@ -1,8 +1,13 @@
+from dataclasses import dataclass
+from typing import Dict
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import ElectraModel
-from dataclasses import dataclass
+from transformers import BertModel, BertConfig, ElectraModel
+
+logger = logging.getLogger(__name__)
 
 
 def masked_cross_entropy_for_value(logits, target, pad_idx=0):
@@ -215,3 +220,12 @@ class SlotGenerator(nn.Module):
             all_point_outputs[:, :, k, :] = p_final.view(batch_size, J, self.vocab_size)
 
         return all_point_outputs, all_gate_outputs
+
+
+class NotTripPy(nn.Module):
+    def __init__(self, model_hyperparameters: Dict):
+        super(NotTripPy, self).__init__()
+        pretrained_model_name = model_hyperparameters["backbone"]["pretrained_model_name_or_path"]
+
+        model_config = BertConfig.from_pretrained(pretrained_model_name)
+        bert_model = BertModel.from_pretrained(pretrained_model_name, config=model_config)

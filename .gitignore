@@ -128,9 +128,13 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# vscode files
+# vscode files and folders
 *.code-workspace
+.vscode
+.vscode/
 
 # Generated files and folders
 [Rr]esults
-config.yaml
+
+# Data folders
+[Dd]ata

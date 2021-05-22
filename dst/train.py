@@ -6,27 +6,29 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AdamW, BertTokenizer, get_linear_schedule_with_warmup
 
 from dst.data import loader
-from dst.evaluation import _evaluation
 from dst.inference import inference
-from dst.model import TRADE, TRADEConfig, masked_cross_entropy_for_value
+from dst.model import NotTripPy, TRADE, TRADEConfig, masked_cross_entropy_for_value
+from dst.data.wos_loader import load_train_dataset
 
 
 class TraineeBase:
     def __init__(
         self,
         trainee_name: str,
-        dataset_paths: Dict,
-        save_paths: Dict,
+        data_paths: Dict[str, str],
+        save_paths: Dict[str, str],
         hyperparameters: Dict,
         device: torch.device,
     ) -> None:
         self.name = trainee_name
         self.device = device
+        self.data_paths = data_paths
         self.save_paths = save_paths
         self.hyperparameters = hyperparameters
 
@@ -40,12 +42,12 @@ class TRADETrainee(TraineeBase):
     def __init__(
         self,
         trainee_name: str,
-        dataset_paths: Dict,
+        data_paths: Dict,
         save_paths: Dict,
         hyperparameters: Dict,
         device: torch.device
     ) -> None:
-        super().__init__(trainee_name, dataset_paths, save_paths, hyperparameters, device)
+        super().__init__(trainee_name, data_paths, save_paths, hyperparameters, device)
 
         tokenizer_model_name = hyperparameters["model"]["prtrained_embedding_model"]
         print(f"Loading [{tokenizer_model_name}] tokenizer...")
@@ -54,23 +56,24 @@ class TRADETrainee(TraineeBase):
         print()
 
         # 이 부분도 생각하지 못했음...좋지 않음
-        with open(dataset_paths["training_slot_meta_data"], 'r') as fr:
+        with open(data_paths["training_slot_meta_data"], 'r') as fr:
             self.slot_meta: List[str] = json.load(fr)
         print("Features loaded")
 
-        features_path = dataset_paths["training_features_data"]
+        features_path = data_paths["training_features_data"]
         if features_path is not None:
             training_datasets, dev_datasets, self.tokenized_slot_meta = loader.load_TRADE_dataset_from_features(
                 features_path,
-                dataset_paths["training_slot_meta_data"],
+                data_paths["training_slot_meta_data"],
                 self.tokenizer
             )
         else:
             training_datasets, dev_datasets, self.tokenized_slot_meta = loader.load_TRADE_dataset_from_raw(
-                dataset_paths["root_dir"],
-                dataset_paths["training_dialogue_data"],
-                dataset_paths["training_slot_meta_data"],
+                data_paths["root_dir"],
+                data_paths["training_dialogue_data"],
+                data_paths["training_slot_meta_data"],
                 self.tokenizer,
+                self.hyperparameters["gate_ids"],
                 dev_split_k=hyperparameters["dev_split"]["split_k"],
                 seed=hyperparameters["seed"],
             )
@@ -86,14 +89,27 @@ class TRADETrainee(TraineeBase):
         print() # End initializing
     
     def train(self):
+        model_save_dir = f"{self.save_paths['root_dir']}/{self.save_paths['checkpoints_dir']}/{self.name}"
+        # 주의: load 및 save 경로 yaml 형식이 변경됨
+
+        if not os.path.isdir(model_save_dir):
+            os.mkdir(model_save_dir)
+
         for fold, (training_dataset, dev_dataset) in enumerate(zip(self.training_datasets, self.dev_datasets)):
             print(f"Training start with fold {fold}...")
+
+            # 기본 세팅
+            if not os.path.isdir(f"{model_save_dir}/{fold}"):
+                os.mkdir(f"{model_save_dir}/{fold}")
+            logger = SummaryWriter(
+                log_dir=f"{self.save_paths['tensorboard_log_dir']}/{self.name}/{fold}/"
+            )
             
             pretrained_model_name = self.hyperparameters["model"]["prtrained_embedding_model"]
 
             config = TRADEConfig(
                 vocab_size=len(self.tokenizer),
-                n_gate=3,   # gate 갯수는 loader._convert_to_TRADE_feature의 gating2id Dictionary 길이와 같다.
+                n_gate=len(self.hyperparameters["gate_ids"]),   # gate 갯수
                 # gate를 yaml에 지정하는게 바람직한 일일까?
                 **self.hyperparameters["model"]["args"]
             )
@@ -103,6 +119,10 @@ class TRADETrainee(TraineeBase):
             model.set_subword_embedding(pretrained_model_name)  # Subword Embedding 초기화
             print(f"Subword Embeddings is loaded from {pretrained_model_name}")
             model.to(self.device)
+
+            # Test 코드
+            # ckpt = torch.load(f"{model_save_dir}/{fold}/model_best.bin", map_location="cpu")
+            # model.load_state_dict(ckpt)
             print("Model initialized")
             print()
 
@@ -170,8 +190,8 @@ class TRADETrainee(TraineeBase):
                     
                     # gating loss
                     loss_2 = loss_fnc_2(
-                        all_gate_outputs.contiguous().view(-1, 3),
-                        # 주의: view의 두번째 인자(3)에는 gate 갯수가 들어가야 함.
+                        all_gate_outputs.contiguous().view(-1, len(self.hyperparameters["gate_ids"])),
+                        # 주의: view의 두번째 인자(3 or 5)에는 gate 갯수가 들어가야 함.
                         gating_ids.contiguous().view(-1),
                     )
                     loss = loss_1 + loss_2
@@ -185,11 +205,25 @@ class TRADETrainee(TraineeBase):
                     if step % 100 == 0:
                         print(f"Epoch: [{epoch}/{n_epochs}], Step: [{step}/{len(train_loader)}]")
                         print(f"loss: {loss.item()} gen_loss: {loss_1.item()} gate_loss: {loss_2.item()}")
+                        logger.add_scalar("Train/loss_sum", loss.item(), epoch * len(train_loader) + step)
+                        logger.add_scalar("Train/gen_loss", loss_1.item(), epoch * len(train_loader) + step)
+                        logger.add_scalar("Train/gate_loss", loss_2.item(), epoch * len(train_loader) + step)
 
-                predictions, labels = inference(model, dev_loader, self.slot_meta, self.device, self.tokenizer)
+                predictions, labels = inference(model, dev_loader, self.slot_meta, self.device, self.tokenizer, self.hyperparameters["gate_ids"])
+
+                logger.add_text("Prediction Sample", "\n".join(str(predictions[0:10])), epoch)
+                logger.add_text("Label Sample", "\n".join(str(labels[0:10])), epoch)
+
                 eval_result = _evaluation(predictions, labels, self.tokenized_slot_meta)
                 for k, v in eval_result.items():
                     print(f"{k}: {v}")
+                # "joint_goal_accuracy": joint_goal_accuracy,
+                # "turn_slot_accuracy": turn_acc_score,
+                # "turn_slot_f1": slot_F1_score,
+
+                logger.add_scalar("Val/joint_goal_accuracy", eval_result["joint_goal_accuracy"], epoch)
+                logger.add_scalar("Val/turn_slot_accuracy", eval_result["turn_slot_accuracy"], epoch)
+                logger.add_scalar("Val/slot_f1", eval_result["turn_slot_f1"], epoch)
 
                 if best_score < eval_result['joint_goal_accuracy']:
                     print("Update Best checkpoint!")
@@ -197,13 +231,12 @@ class TRADETrainee(TraineeBase):
                     best_checkpoint = epoch
 
                     # 모델 저장
-                    if not os.path.isdir(f"{self.save_paths['checkpoints_dir']}/{fold}"):
-                        os.mkdir(f"{self.save_paths['checkpoints_dir']}/{fold}")
-
-                    save_file_path = f"{self.save_paths['checkpoints_dir']}/{fold}/model_best.bin"
+                    save_file_path = f"{model_save_dir}/{fold}/model_best.bin"
 
                     torch.save(model.state_dict(), save_file_path)
                     print(f"Best checkpoint saved at {save_file_path}")
+            
+            print(f"Best checkpoint for fold {fold} is {best_checkpoint} epoch.")
 
 
 def _evaluation(preds, labels: List[List[str]], slot_meta):
@@ -218,9 +251,6 @@ def _evaluation(preds, labels: List[List[str]], slot_meta):
     result = evaluator.compute()
     print(result)
     return result
-
-
-
 
 
 class DSTEvaluator:
@@ -301,6 +331,34 @@ def compute_prf(gold, pred):
         else:
             precision, recall, F1, count = 0, 0, 0, 1
     return F1, recall, precision, count
+
+
+class TripPyTrainee(TraineeBase):
+    def __init__(
+            self, 
+            trainee_name: str, 
+            data_paths: Dict[str, str], 
+            save_paths: Dict[str, str], 
+            hyperparameters: Dict, 
+            device: torch.device
+        ) -> None:
+        super().__init__(trainee_name, data_paths, save_paths, hyperparameters, device)
+
+        train_dial_path = os.path.join(
+            os.path.abspath(self.data_paths["train_root_dir"]), 
+            self.data_paths["training_dialogue_file"]
+        )
+        train_slot_meta_path = os.path.join(
+            os.path.abspath(self.data_paths["train_root_dir"]), 
+            self.data_paths["training_slot_meta_file"]
+        )
+
+        tokenizer = BertTokenizer.from_pretrained(**self.hyperparameters["tokenizer"])
+        # 다른 모델 타입의 토크나이저를 사용하기 위한 대비도 나중에 필요할 수 있음
+        train_dataset = load_train_dataset(train_dial_path, train_slot_meta_path, tokenizer)
+    
+    def train(self):
+        model = NotTripPy(self.hyperparameters["model"])
 
 
 
